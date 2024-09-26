@@ -259,7 +259,7 @@ impl Fits {
 
             egui::ScrollArea::vertical()
                 .max_height(300.0)
-                .id_source("Context menu fit stats grid")
+                .id_salt("Context menu fit stats grid")
                 .show(ui, |ui| {
                     self.fit_stats_grid_ui(ui);
                 });

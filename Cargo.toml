@@ -1,6 +1,6 @@
 [package]
 name = "gnat"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Alex Conley <imaconley1@gmail.com>"]
 edition = "2021"
 rust-version = "1.76"
@@ -10,8 +10,8 @@ all-features = true
 targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
 [dependencies]
-egui = "0.28.1"
-eframe = { version = "0.28.1", default-features = false, features = [
+egui = "0.29.0"
+eframe = { version = "0.29.0", default-features = false, features = [
     "default_fonts", # Embed the default egui fonts.
     "glow",          # Use the glow rendering backend. Alternative: "wgpu".
     "persistence",   # Enable restoring app state when restarting the app.
@@ -19,25 +19,25 @@ eframe = { version = "0.28.1", default-features = false, features = [
 log = "0.4"
 
 # You only need serde if you want app persistence:
-serde = { version = "1.0.208", features = ["derive"] }
+serde = { version = "1.0.210", features = ["derive"] }
 
-egui_plot = {version = "0.28.1", features = ["serde"] }
-egui_tiles = "0.9.0"
-egui_extras = {version = "0.28.1", features = ["syntect"] }
-epaint = "0.28.1"
+egui_plot = {version = "0.29.0", features = ["serde"] }
+egui_tiles = "0.10.0"
+egui_extras = {version = "0.29.0", features = ["syntect"] }
+epaint = "0.29.0"
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11.5"
 
 # performant will make the compile times slower but should make the histogrammer faster
-polars = { version = "0.41.3", features = ["lazy", "parquet", "performant"] }
-polars-lazy = { version = "0.41.3", features = ["hist"] }
+polars = { version = "0.41.0", features = ["lazy", "parquet", "performant"] }
+polars-lazy = { version = "0.41.0", features = ["hist"] }
 
-rfd = "0.13"
+rfd = "0.15.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.31"
-serde_json = "1.0.125"
+serde_json = "1.0.128"
 geo = "0.28.0"
 fnv = "1.0.7"
 varpro = "0.10.0"
@@ -49,10 +49,7 @@ find_peaks = "0.1.5"
 # web:
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
-
-# to access the DOM (to hide the loading text)
-[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
-version = "0.3.4"
+web-sys = "0.3.70" # to access the DOM (to hide the loading text)
 
 [profile.release]
 opt-level = 2 # fast and small wasm

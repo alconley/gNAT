@@ -41,6 +41,10 @@ impl Default for PlotSettings {
 }
 impl PlotSettings {
     pub fn settings_ui(&mut self, ui: &mut egui::Ui, max_z_range: u64) {
+        if ui.button("Recalculate Image").clicked() {
+            self.recalculate_image = true;
+        }
+
         ui.menu_button("Colormaps", |ui| {
             self.colormap_options
                 .ui(ui, &mut self.recalculate_image, max_z_range);

@@ -47,6 +47,7 @@ impl Default for EguiImage {
                 magnification: egui::TextureFilter::Nearest,
                 minification: egui::TextureFilter::Nearest,
                 wrap_mode: egui::TextureWrapMode::ClampToEdge,
+                mipmap_mode: None,
             },
         }
     }
@@ -214,6 +215,23 @@ impl EguiImage {
                     "MirroredRepeat",
                 );
             });
+
+            // combo box between None, TextureFilter::Nearest, TextureFilter::Linear
+            egui::ComboBox::from_id_salt("mipmap_mode")
+                .selected_text(format!("{:?}", self.texture_options.mipmap_mode))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.texture_options.mipmap_mode, None, "None");
+                    ui.selectable_value(
+                        &mut self.texture_options.mipmap_mode,
+                        Some(TextureFilter::Nearest),
+                        "Nearest",
+                    );
+                    ui.selectable_value(
+                        &mut self.texture_options.mipmap_mode,
+                        Some(TextureFilter::Linear),
+                        "Linear",
+                    );
+                });
 
             ui.separator();
 

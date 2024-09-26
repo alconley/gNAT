@@ -75,9 +75,9 @@ impl Histogram2D {
         self.plot_settings.progress = Some(current_step as f32 / total_steps as f32);
 
         // only recalculate the image every 10% of the total steps
-        if current_step % (total_steps / 10) == 0 {
-            self.plot_settings.recalculate_image = true;
-        }
+        // if current_step % (total_steps / 10) == 0 {
+        self.plot_settings.recalculate_image = true;
+        // }
     }
 
     // get the bin index for a given x value

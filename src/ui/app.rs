@@ -5,9 +5,7 @@ use crate::util::processer::Processer;
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)] // if we add new fields, give them default values when deserializing old state
 pub struct GNATApp {
-    // tree: egui_tiles::Tree<Pane>,
     processer: Processer,
-    // behavior: TreeBehavior,
     left_side_panel_open: bool,
     right_side_panel_open: bool,
 }
@@ -56,7 +54,7 @@ impl eframe::App for GNATApp {
                 ui.horizontal(|ui| {
                     ui.heading("gNAT");
 
-                    egui::global_dark_light_mode_switch(ui);
+                    egui::global_theme_preference_switch(ui);
 
                     if ui.button("Reset").clicked() {
                         self.processer.reset();
@@ -64,7 +62,7 @@ impl eframe::App for GNATApp {
                 });
 
                 egui::ScrollArea::vertical()
-                    .id_source("LeftPanel")
+                    .id_salt("LeftPanel")
                     .show(ui, |ui| {
                         ui.separator();
 

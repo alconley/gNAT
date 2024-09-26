@@ -71,7 +71,7 @@ impl Histogram {
     pub fn keybinds_ui(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("Keybind Help", |ui| {
             egui::ScrollArea::vertical()
-            .id_source("keybinds_scroll")
+            .id_salt("keybinds_scroll")
             .max_height(300.0)
             .show(ui, |ui| {
                 ui.heading("Keybinds");

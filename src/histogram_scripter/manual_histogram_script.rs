@@ -1,22 +1,22 @@
 use crate::histoer::histogrammer::Histogrammer;
 
 use polars::prelude::*;
-// use std::f64::consts::PI;
+use std::f64::consts::PI;
 
 #[rustfmt::skip]
 #[allow(clippy::all)]
 pub fn manual_add_histograms(h: &mut Histogrammer, lf: LazyFrame) {
 
-    let lf = lf.with_columns(vec![
-        (lit(0.5395)*col("PIPS1000Energy") + lit(2.5229)).alias("PIPS1000EnergyCalibrated")
-    ]);
+    // let lf = lf.with_columns(vec![
+    //     (lit(0.5395)*col("PIPS1000Energy") + lit(2.5229)).alias("PIPS1000EnergyCalibrated")
+    // ]);
 
-    h.add_fill_hist1d("PIPS1000", &lf, "PIPS1000Energy", 2000, (0.0, 2000.0), None);
-    h.add_fill_hist1d("PIPS1000_EnergyCalibrated", &lf, "PIPS1000EnergyCalibrated", 1200, (0.0, 1200.0), None);
+    // h.add_fill_hist1d("PIPS1000", &lf, "PIPS1000Energy", 2000, (0.0, 2000.0), None);
+    // h.add_fill_hist1d("PIPS1000_EnergyCalibrated", &lf, "PIPS1000EnergyCalibrated", 1200, (0.0, 1200.0), None);
 
 
 
-    /* 
+    // /* 
     // Declare all the lazyframes that will be used
     let lf = lf.with_columns(vec![
         (col("DelayFrontRightEnergy") + col("DelayFrontLeftEnergy") / lit(2.0)).alias("DelayFrontAverageEnergy"),
@@ -307,5 +307,5 @@ pub fn manual_add_histograms(h: &mut Histogrammer, lf: LazyFrame) {
     */
 
     
-    */
+    // */
 }

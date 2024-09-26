@@ -121,7 +121,7 @@ impl AddHisto1d {
             }
         }
 
-        egui::ComboBox::from_id_source(format!("Add grid selector {}", self.id))
+        egui::ComboBox::from_id_salt(format!("Add grid selector {}", self.id))
             .selected_text(self.grid.clone().unwrap_or_else(|| "None".to_string()))
             .show_ui(ui, |ui| {
                 for grid in grid_options {
@@ -227,7 +227,7 @@ impl AddHisto2d {
             }
         }
 
-        egui::ComboBox::from_id_source(format!("Add Grid selector {}", self.id))
+        egui::ComboBox::from_id_salt(format!("Add Grid selector {}", self.id))
             .selected_text(self.grid.clone().unwrap_or_else(|| "None".to_string()))
             .show_ui(ui, |ui| {
                 for grid in grid_options {
@@ -283,7 +283,7 @@ impl FillHisto1d {
         histogram_names: Vec<String>,
     ) {
         //combobox for histogram name
-        egui::ComboBox::from_id_source(format!("Fill name selector {}", self.id))
+        egui::ComboBox::from_id_salt(format!("Fill name selector {}", self.id))
             .selected_text(&self.name)
             .show_ui(ui, |ui| {
                 for name in &histogram_names {
@@ -291,7 +291,7 @@ impl FillHisto1d {
                 }
             });
 
-        egui::ComboBox::from_id_source(format!("Fill lazyframe selector {}", self.id))
+        egui::ComboBox::from_id_salt(format!("Fill lazyframe selector {}", self.id))
             .selected_text(&self.lazyframe)
             .show_ui(ui, |ui| {
                 for lf in &lazyframe_info.lfs {
@@ -301,7 +301,7 @@ impl FillHisto1d {
 
         ui.horizontal(|ui| {
             ui.label("X:");
-            egui::ComboBox::from_id_source(format!("Fill Column selector {}", self.id))
+            egui::ComboBox::from_id_salt(format!("Fill Column selector {}", self.id))
                 .selected_text(&self.column)
                 .show_ui(ui, |ui| {
                     for column in &lazyframe_info.columns {
@@ -355,7 +355,7 @@ impl FillHisto2d {
         lazyframe_info: LazyFrameInfo,
         histogram_names: Vec<String>,
     ) {
-        egui::ComboBox::from_id_source(format!("Fill name selector {}", self.id))
+        egui::ComboBox::from_id_salt(format!("Fill name selector {}", self.id))
             .selected_text(&self.name)
             .show_ui(ui, |ui| {
                 for name in &histogram_names {
@@ -363,7 +363,7 @@ impl FillHisto2d {
                 }
             });
 
-        egui::ComboBox::from_id_source(format!("Fill lazyframe selector {}", self.id))
+        egui::ComboBox::from_id_salt(format!("Fill lazyframe selector {}", self.id))
             .selected_text(&self.lazyframe)
             .show_ui(ui, |ui| {
                 for lf in &lazyframe_info.lfs {
@@ -374,7 +374,7 @@ impl FillHisto2d {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.label("X:");
-                egui::ComboBox::from_id_source(format!("Fill {}-X Column ComboBox", self.id))
+                egui::ComboBox::from_id_salt(format!("Fill {}-X Column ComboBox", self.id))
                     .selected_text(&self.x_column)
                     .show_ui(ui, |ui| {
                         for column in &lazyframe_info.columns {
@@ -385,7 +385,7 @@ impl FillHisto2d {
 
             ui.horizontal(|ui| {
                 ui.label("Y:");
-                egui::ComboBox::from_id_source(format!("Fill {}-Y Column ComboBox", self.id))
+                egui::ComboBox::from_id_salt(format!("Fill {}-Y Column ComboBox", self.id))
                     .selected_text(&self.y_column)
                     .show_ui(ui, |ui| {
                         for column in &lazyframe_info.columns {
