@@ -1,6 +1,7 @@
 pub mod context_menu;
 pub mod custom_plot_manipulation;
 pub mod filling;
+mod fit_worker;
 pub mod fitting;
 pub mod histogram1d;
 pub mod interactive_cuts;

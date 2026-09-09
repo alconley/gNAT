@@ -112,7 +112,7 @@ impl LinearFitter {
                 self.data.x.clone(),
                 self.data.y.clone(),
             ),
-            &spectrix_fitting::FitOptions::default(),
+            &spectrix_fitting::FitOptions::robust(),
         )?;
         crate::fitter::native::apply_estimate(&mut self.paramaters.slope, &result, "slope");
         crate::fitter::native::apply_estimate(&mut self.paramaters.intercept, &result, "intercept");

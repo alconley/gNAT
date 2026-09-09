@@ -325,3 +325,237 @@ fn every_run_83_marker_has_a_stable_poisson_single_peak_fit() {
         );
     }
 }
+
+#[test]
+fn robust_run_83_fit_reports_constraints_and_is_stable_when_repeated() {
+    let (x, y) = run_83_histogram();
+    for objective in [ObjectiveKind::LeastSquares, ObjectiveKind::PoissonDeviance] {
+        let options = FitOptions {
+            objective,
+            ..FitOptions::robust()
+        };
+        let markers = vec![
+            -205.0, -177.0, -152.0, -121.0, -65.0, -45.0, 10.0, 26.0, 50.0, 80.0,
+        ];
+        let windows = vec![(-220.0, -213.0), (93.0, 100.0)];
+        let estimate = estimate_manual_peak_seeds(
+            &ManualSeedEstimateRequest {
+                x: x.clone(),
+                y: y.clone(),
+                bin_width: 1.0,
+                region: [-220.0, 100.0],
+                peak_markers: markers,
+                background_markers: windows.clone(),
+                background: BackgroundKind::Constant,
+                background_seed: None,
+                equal_sigma: false,
+            },
+            &options,
+        )
+        .expect("run-83 estimates");
+        let mut request = PeakFitRequest {
+            x: x.clone(),
+            y: y.clone(),
+            bin_width: 1.0,
+            region: [-220.0, 100.0],
+            peak_seeds: estimate.peaks.iter().map(|peak| peak.seed).collect(),
+            peak_bounds: Some(estimate.peaks.iter().map(|peak| peak.bounds).collect()),
+            background_markers: windows,
+            background: BackgroundKind::Constant,
+            background_seed: None,
+            background_coupling: BackgroundCoupling::PrefitJoint,
+            equal_sigma: false,
+            free_centers: true,
+            sigma_bounds: None,
+        };
+        let result = fit_peaks(&request, &options).expect("robust run-83 fit");
+        assert!(
+            result.fit.termination.success,
+            "{objective:?}: {:?}",
+            result.fit.diagnostics
+        );
+        if objective == ObjectiveKind::LeastSquares {
+            assert!(
+                result.fit.covariance.is_some(),
+                "{:?}",
+                result.fit.diagnostics
+            );
+        } else {
+            // The estimated g1 height lower limit genuinely constrains this data.
+            // Retain that limit and explicitly report conditional geometry.
+            assert!(result.fit.covariance.is_none());
+            assert_eq!(
+                result.fit.diagnostics.covariance_status,
+                spectrix_fitting::CovarianceStatus::ActiveBounds
+            );
+            assert_eq!(result.fit.diagnostics.affected_parameters, ["g1_height"]);
+        }
+        let value = |name: &str| {
+            result
+                .fit
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == name)
+                .expect("parameter")
+                .value
+        };
+        for (index, seed) in request.peak_seeds.iter_mut().enumerate() {
+            seed.center = value(&format!("g{index}_center"));
+            seed.sigma = value(&format!("g{index}_sigma"));
+            seed.amplitude = value(&format!("g{index}_amplitude"));
+        }
+        request.background_seed = Some(BackgroundSeed {
+            parameters: vec![ParameterDefinition::varying("bg_c", value("bg_c"))],
+        });
+        let repeated = fit_peaks(&request, &options).expect("repeat robust run-83 fit");
+        let first = result.fit.statistics.final_objective;
+        let second = repeated.fit.statistics.final_objective;
+        assert!(
+            first - second <= 1.0e-8 * first.max(1.0),
+            "{objective:?}: {first} -> {second}"
+        );
+        if objective == ObjectiveKind::PoissonDeviance {
+            let mut unconstrained = request;
+            for bounds in unconstrained.peak_bounds.as_mut().expect("bounds") {
+                bounds.net_height[0] = 0.0;
+            }
+            let interior = fit_peaks(&unconstrained, &options).expect("interior Poisson fit");
+            assert!(
+                interior.fit.termination.success,
+                "{:?}",
+                interior.fit.diagnostics
+            );
+            assert!(
+                interior.fit.covariance.is_some(),
+                "{:?}",
+                interior.fit.diagnostics
+            );
+            assert!(interior.fit.statistics.final_objective < second);
+        }
+    }
+}
+
+#[test]
+fn crowded_run_83_window_background_stays_fixed_in_the_application() {
+    use spectrix::fitter::main_fitter::{BackgroundModel, FitResult};
+    use spectrix::histoer::histo1d::histogram1d::Histogram;
+    let (x, y) = run_83_histogram();
+    for (kind, model) in [
+        (
+            BackgroundKind::Linear,
+            BackgroundModel::Linear(Default::default()),
+        ),
+        (
+            BackgroundKind::Quadratic,
+            BackgroundModel::Quadratic(Default::default()),
+        ),
+        (
+            BackgroundKind::Exponential,
+            BackgroundModel::Exponential(Default::default()),
+        ),
+    ] {
+        for explicit_background_fit in [false, true] {
+            let mut histogram = Histogram::new("Xavg", 600, (-300.0, 300.0));
+            histogram.bins = y.iter().map(|count| *count as u64).collect();
+            histogram.fits.settings.background_model = model.clone();
+            histogram.fits.settings.equal_stddev = false;
+            histogram.fits.settings.free_position = true;
+            histogram.plot_settings.markers.add_region_marker(-55.0);
+            histogram.plot_settings.markers.add_region_marker(2.0);
+            for center in [-45.0, -38.0, -26.5, -19.0, -12.0, -8.5, -3.5] {
+                histogram.plot_settings.markers.add_peak_marker(center);
+            }
+            let windows = if kind == BackgroundKind::Quadratic {
+                vec![(-57.0, -54.0), (0.0, 3.0)]
+            } else {
+                vec![(-56.0, -55.0), (1.0, 2.0)]
+            };
+            histogram
+                .plot_settings
+                .markers
+                .set_background_marker_positions(&windows);
+            if explicit_background_fit {
+                histogram.fit_background();
+                assert_eq!(
+                    histogram
+                        .fits
+                        .temp_fit
+                        .as_ref()
+                        .expect("background fit")
+                        .objective,
+                    ObjectiveKind::LeastSquares
+                );
+            }
+            histogram.refresh_manual_peak_guesses();
+            let submitted_bounds = histogram.plot_settings.markers.get_peak_bounds();
+            histogram.fit_gaussians();
+            let temp = histogram.fits.temp_fit.as_ref().expect("peak fit");
+            let Some(FitResult::Gaussian(gaussian)) = &temp.fit_result else {
+                panic!("Gaussian fit");
+            };
+            assert_eq!(
+                gaussian.background_coupling,
+                BackgroundCoupling::PrefitFrozen
+            );
+            let expected = spectrix_fitting::fit_background(
+                &spectrix_fitting::BackgroundFitRequest {
+                    x: x.clone(),
+                    y: y.clone(),
+                    bin_width: 1.0,
+                    region: [-55.0, 2.0],
+                    markers: windows,
+                    kind,
+                    seed: None,
+                },
+                &FitOptions::robust(),
+            )
+            .expect("window background");
+            let native = gaussian.native_result.as_ref().expect("native result");
+            for parameter in native
+                .fit
+                .parameters
+                .iter()
+                .filter(|parameter| parameter.name.starts_with("bg_"))
+            {
+                let before = expected
+                    .parameters
+                    .iter()
+                    .find(|value| value.name == parameter.name)
+                    .expect("window coefficient");
+                assert!(
+                    (parameter.value - before.value).abs() < 1.0e-6 * before.value.abs().max(1.0),
+                    "{kind:?}: {} moved from {} to {}",
+                    parameter.name,
+                    before.value,
+                    parameter.value
+                );
+                assert_eq!(parameter.kind, spectrix_fitting::ParameterKind::Fixed);
+            }
+            assert_eq!(
+                histogram.plot_settings.markers.get_peak_bounds(),
+                submitted_bounds
+            );
+            assert_eq!(
+                histogram.plot_settings.markers.preview_background,
+                gaussian
+                    .background_result
+                    .as_ref()
+                    .expect("display baseline")
+                    .get_fit_points()
+            );
+            assert!(
+                gaussian
+                    .fit_report
+                    .contains("conditional on the fixed background")
+            );
+            assert!(
+                native
+                    .fit
+                    .observation_x
+                    .iter()
+                    .all(|x| (-55.0..=2.0).contains(x))
+            );
+            assert_eq!(gaussian.fit_result.len(), 7);
+        }
+    }
+}

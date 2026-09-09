@@ -23,6 +23,8 @@ pub struct Histogram {
     pub follow_theme_colors: bool,
     #[serde(skip)]
     pub(crate) live_background: LiveBackgroundState,
+    #[serde(skip)]
+    pub(crate) fit_worker: super::fit_worker::FitWorkState,
 }
 
 const fn default_true() -> bool {
@@ -58,6 +60,7 @@ impl Histogram {
             generation_defaults: defaults.clone(),
             follow_theme_colors: true,
             live_background: LiveBackgroundState::default(),
+            fit_worker: super::fit_worker::FitWorkState::default(),
         };
         histogram.apply_generation_defaults(defaults);
         histogram
@@ -280,6 +283,7 @@ impl Histogram {
             self.line.set_color(color);
         }
 
+        self.apply_fit_worker();
         self.apply_live_background();
         self.refresh_live_background(ui.ctx().clone());
         self.update_line_points();
@@ -297,11 +301,15 @@ impl Histogram {
         }
         if let Some(status) = &self.live_background.status {
             ui.small(status).on_hover_text(
-                "Adding a background window or releasing a moved window updates the background automatically, without G. Active temporary peak fits are rebuilt in the worker; stored fits are unchanged.",
+                "The selected background is estimated from the region when there are no windows. Supplied windows determine a background that stays fixed during peak fitting. Temporary fits update in the worker; stored fits change only when explicitly refitted.",
             );
         }
         self.apply_refit_all_request();
         self.apply_modify_fit_request();
+        self.refresh_fit_worker(ui.ctx().clone());
+        if let Some(status) = &self.fit_worker.status {
+            ui.small(status).on_hover_text("Fits run in a worker and keep the lowest objective found within one shared evaluation budget. Input changes discard an outdated result; see the fit report for convergence and uncertainty details.");
+        }
 
         if let Some(message) = self.calibration_warning_message() {
             ui.colored_label(egui::Color32::from_rgb(200, 120, 0), message);

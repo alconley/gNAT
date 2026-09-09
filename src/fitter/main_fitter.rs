@@ -90,7 +90,7 @@ impl BackgroundResult {
         }
     }
 
-    fn set_display_range(&mut self, range: (f64, f64)) {
+    pub(crate) fn set_display_range(&mut self, range: (f64, f64)) {
         let (minimum, maximum) = if range.0 <= range.1 {
             range
         } else {
@@ -122,6 +122,22 @@ impl BackgroundResult {
     }
 }
 
+pub(crate) fn background_display_range(
+    region: &[f64],
+    windows: &[(f64, f64)],
+) -> Option<(f64, f64)> {
+    let mut positions = region
+        .iter()
+        .copied()
+        .chain(windows.iter().flat_map(|(start, end)| [*start, *end]))
+        .filter(|position| position.is_finite());
+    let first = positions.next()?;
+    let range = positions.fold((first, first), |(minimum, maximum), position| {
+        (minimum.min(position), maximum.max(position))
+    });
+    (range.0 < range.1).then_some(range)
+}
+
 impl BackgroundModel {
     pub fn type_name(&self) -> String {
         match self {
@@ -148,6 +164,9 @@ pub struct Fitter {
     pub native_background_result: Option<NativeFitResult>,
     /// True only when the user explicitly ran a background-only fit.
     pub background_was_fit_manually: bool,
+    /// Transient input mode for a region estimate without manual windows.
+    #[serde(skip)]
+    pub automatic_background: bool,
     pub background_coupling: BackgroundCoupling,
     pub manual_peak_bounds: Option<Vec<ManualPeakBounds>>,
     pub objective: ObjectiveKind,
@@ -175,6 +194,7 @@ impl Default for Fitter {
             background_result: None,
             native_background_result: None,
             background_was_fit_manually: false,
+            automatic_background: false,
             background_coupling: BackgroundCoupling::PrefitFrozen,
             manual_peak_bounds: None,
             objective: ObjectiveKind::PoissonDeviance,
@@ -217,6 +237,7 @@ impl Fitter {
             background_result: None,
             native_background_result: None,
             background_was_fit_manually: false,
+            automatic_background: false,
             background_coupling: BackgroundCoupling::PrefitFrozen,
             manual_peak_bounds: None,
             objective: ObjectiveKind::PoissonDeviance,
@@ -285,10 +306,10 @@ impl Fitter {
                             if min_x.is_finite() && max_x.is_finite() && min_x <= max_x {
                                 Some((vec![min_x], vec![max_x]))
                             } else {
-                                log::warn!(
-                                    "σ(E) bounds incompatible across peaks; dropping equal-σ bounds"
+                                self.last_fit_error = Some(
+                                    "The calibrated width limits have no common range for a shared width. Adjust the limits or use independent widths.".to_owned(),
                                 );
-                                None
+                                return;
                             }
                         } else {
                             let mins_x: Vec<f64> = deds.iter().map(|d| min_e / *d).collect();
@@ -407,14 +428,22 @@ impl Fitter {
         let model = self.background_model.clone();
         let options = NativeFitOptions {
             objective: self.objective,
-            ..NativeFitOptions::default()
+            ..NativeFitOptions::robust()
         };
         let request = BackgroundFitRequest {
             x: self.data.x.clone(),
             y: self.data.y.clone(),
             bin_width,
-            region: [minimum, maximum],
-            markers: vec![(minimum, maximum)],
+            region: if minimum == maximum {
+                [minimum - 0.5 * bin_width, maximum + 0.5 * bin_width]
+            } else {
+                [minimum, maximum]
+            },
+            markers: if self.automatic_background {
+                Vec::new()
+            } else {
+                vec![(minimum, maximum)]
+            },
             kind: native::background_kind(&model),
             seed: Some(native::background_seed(
                 &model,
@@ -710,5 +739,87 @@ mod tests {
         assert_eq!(fitter.background_line.points.len(), 256);
         assert_eq!(fitter.background_line.points.first(), Some(&[0.0, 1.0]));
         assert_eq!(fitter.background_line.points.last(), Some(&[10.0, 21.0]));
+    }
+
+    #[test]
+    fn loaded_peak_fit_displays_background_through_all_windows_without_refitting() {
+        let background = BackgroundResult::Linear(LinearFitter::new_from_parameters(
+            (0.2, 0.01),
+            (20.0, 0.1),
+            -15.0,
+            0.0,
+        ));
+        let composition = vec![[-15.0, 25.0], [0.0, 30.0]];
+        let gaussian = crate::fitter::models::gaussian::GaussianFitter {
+            region_markers: vec![-15.0, 0.0],
+            background_markers: vec![(2.0, 1.0), (-54.0, -55.0)],
+            background_result: Some(background.clone()),
+            fit_points: composition.clone(),
+            ..Default::default()
+        };
+        let fitter = Fitter {
+            background_result: Some(background),
+            fit_result: Some(super::FitResult::Gaussian(gaussian)),
+            ..Fitter::default()
+        };
+        let encoded = ron::to_string(&fitter).expect("saved fit");
+        let mut loaded: Fitter = ron::from_str(&encoded).expect("load fit");
+        loaded.compact_display_data();
+        assert_eq!(
+            loaded.background_line.points.first().map(|point| point[0]),
+            Some(-55.0)
+        );
+        assert_eq!(
+            loaded.background_line.points.last().map(|point| point[0]),
+            Some(2.0)
+        );
+        assert_eq!(loaded.composition_line.points, composition);
+        let Some(super::FitResult::Gaussian(gaussian)) = &loaded.fit_result else {
+            panic!("retained Gaussian fit");
+        };
+        assert!(
+            gaussian.native_result.is_none(),
+            "display changes must not refit"
+        );
+        assert_eq!(gaussian.region_markers, [-15.0, 0.0]);
+        assert_eq!(
+            gaussian
+                .background_result
+                .as_ref()
+                .expect("background")
+                .evaluate(0.0),
+            20.0
+        );
+    }
+
+    #[test]
+    fn incompatible_calibrated_shared_width_limits_are_not_discarded() {
+        let mut fitter = Fitter::default();
+        fitter.calibration.a.value = 0.5;
+        fitter.calibration.b.value = 0.0;
+        fitter.fit_model = super::FitModel::Gaussian(
+            vec![0.0, 3.0],
+            [1.0, 2.0]
+                .into_iter()
+                .map(|center| spectrix_fitting::ManualPeakSeed {
+                    center,
+                    sigma: 1.0,
+                    amplitude: 100.0,
+                })
+                .collect(),
+            Vec::new(),
+            true,
+            true,
+            Some((1.0, 1.1)),
+            true,
+        );
+        fitter.fit();
+        assert!(fitter.fit_result.is_none());
+        assert!(
+            fitter
+                .last_fit_error
+                .as_deref()
+                .is_some_and(|message| message.contains("no common range"))
+        );
     }
 }

@@ -42,7 +42,7 @@ let request = PeakFitRequest {
     sigma_bounds: None,
 };
 
-let mut options = FitOptions::default();
+let mut options = FitOptions::robust();
 options.objective = ObjectiveKind::PoissonDeviance;
 let result = fit_peaks(&request, &options)?;
 assert!(result.fit.termination.success);
@@ -51,7 +51,13 @@ assert!(result.fit.confidence_band.is_some());
 # Ok::<(), spectrix_fitting::FitError>(())
 ```
 
-Use `BackgroundCoupling::PrefitFrozen` only with explicit fixed background seed values (Spectrix's **Lock manual background** workflow). Use `BackgroundCoupling::PrefitJoint` to initialize the selected background in the explicit marker windows and vary it with the peaks, including cross-correlation. Peak seeds are required; non-`None` backgrounds require at least one explicit marker window. Optional `ManualPeakBounds` constrain position, sigma, and net bin height one-for-one with the seeds. The fitter varies net height directly so width changes do not implicitly move the peak height, then reports integrated amplitude and area as derived parameters. It performs one deterministic composite solve from the supplied seeds.
+Use `FitOptions::robust()` for new fits. The application uses this profile automatically. It moves boundary starting values slightly inward without changing user bounds, checks physical projected gradients, and polishes the complete solution. Failed stationarity or uncertainty checks trigger three deterministic width alternatives for peak fits. All optimizer attempts share `evaluation_patience * (nvarys + 1)` residual evaluations; the lowest finite objective is retained, regardless of covariance availability. `FitOptions::default()` retains the `Lmfit134` compatibility profile and its single-solve behavior.
+
+Choose the background family explicitly. With the robust profile, empty background windows request a peak-resistant asymmetric least-squares initialization over the region (at most ten passes, weights 0.05 above the estimate and 0.95 below). These weights are only for initialization: the final joint fit uses the selected objective. Supplied windows initialize the background and, for `BackgroundCoupling::PrefitJoint`, remain in the joint fit as a union with the region. Each original bin is counted once, including external windows; the full peak-plus-background equation is evaluated there. `observation_x` identifies the residual grid, while `evaluation_x` remains the display grid. The compatibility profile still requires explicit windows for non-`None` backgrounds.
+
+The application uses `BackgroundCoupling::PrefitFrozen` whenever background windows are supplied: it fits the selected background to those bins and holds the result fixed during peak fitting. The library still offers `PrefitJoint` explicitly. Use `PrefitFrozen` with fixed seed values to hold an existing background result (the application's **Lock manual background** workflow). Peak uncertainties then condition on the fixed background and exclude its uncertainty. Optional `ManualPeakBounds` constrain position, sigma, and net bin height one-for-one with the required seeds. The fitter varies net height directly, then reports integrated amplitude and area as derived parameters; recovery never changes peak count, fixed values, shared-width constraints, or user bounds.
+
+Robust covariance comes from a column-scaled SVD of the physical information Jacobian. Least-squares covariance uses reduced-chi-square scaling; Poisson covariance uses expected information. Unconverged, rank-deficient, and boundary-limited solutions retain fitted values but withhold symmetric uncertainties. `FitResult::diagnostics` reports attempts, stationarity, rank when available, affected parameters, and budget exhaustion. New diagnostics and observation coordinates default safely when reading older saved results.
 
 Histogram Gaussians are integrated across bin edges while retaining Spectrix's existing amplitude and area conventions.
 

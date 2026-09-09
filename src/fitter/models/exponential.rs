@@ -103,7 +103,7 @@ impl ExponentialFitter {
                 self.data.x.clone(),
                 self.data.y.clone(),
             ),
-            &spectrix_fitting::FitOptions::default(),
+            &spectrix_fitting::FitOptions::robust(),
         )?;
         crate::fitter::native::apply_estimate(&mut self.paramaters.amplitude, &result, "amplitude");
         crate::fitter::native::apply_estimate(&mut self.paramaters.decay, &result, "decay");

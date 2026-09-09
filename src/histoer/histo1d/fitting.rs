@@ -10,9 +10,15 @@ use std::hash::{Hash as _, Hasher as _};
 
 fn background_coupling_for_fit(
     background_model: &BackgroundModel,
+    has_background_windows: bool,
     lock_manual_background: bool,
 ) -> BackgroundCoupling {
-    if lock_manual_background && !matches!(background_model, BackgroundModel::None) {
+    if (has_background_windows || lock_manual_background)
+        && !matches!(
+            background_model,
+            BackgroundModel::None | BackgroundModel::LegacyAuto
+        )
+    {
         BackgroundCoupling::PrefitFrozen
     } else {
         BackgroundCoupling::PrefitJoint
@@ -24,7 +30,10 @@ fn reusable_manual_background(temp_fit: Option<&Fitter>) -> Option<&Fitter> {
 }
 
 impl Histogram {
-    fn resolved_objective(&self, range: Option<(f64, f64)>) -> spectrix_fitting::ObjectiveKind {
+    pub(super) fn resolved_objective(
+        &self,
+        range: Option<(f64, f64)>,
+    ) -> spectrix_fitting::ObjectiveKind {
         let counts = range.map_or_else(
             || self.bins.iter().map(|count| *count as f64).collect(),
             |(start, end)| self.get_bin_counts_between(start, end),
@@ -32,7 +41,7 @@ impl Histogram {
         self.fits.settings.objective.resolve(counts)
     }
 
-    fn manual_estimate_signature(&self) -> u64 {
+    pub(super) fn manual_estimate_signature(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.bin_width.to_bits().hash(&mut hasher);
         self.bins.hash(&mut hasher);
@@ -58,7 +67,7 @@ impl Histogram {
     pub fn refresh_manual_peak_guesses(&mut self) {
         // Background marker edits are solved by the worker. Do not run a second background
         // optimization here, or modify peak seeds while the composite snapshot is in flight.
-        if self.background_update_pending() {
+        if self.background_update_pending() || self.fit_worker.is_pending() {
             return;
         }
         if matches!(
@@ -99,18 +108,6 @@ impl Histogram {
             return;
         }
         let background_markers = self.plot_settings.markers.get_background_marker_positions();
-        if !matches!(self.fits.settings.background_model, BackgroundModel::None)
-            && background_markers.is_empty()
-        {
-            self.plot_settings.markers.estimate_error = Some(
-                "Place at least one background marker window for the selected background model."
-                    .to_owned(),
-            );
-            self.plot_settings.markers.preview_background.clear();
-            self.plot_settings.markers.estimate_signature = signature;
-            self.plot_settings.markers.invalid_estimate_signature = signature;
-            return;
-        }
 
         if retry_invalid_estimates {
             for guess in &mut self.plot_settings.markers.peak_markers {
@@ -160,7 +157,7 @@ impl Histogram {
         };
         let options = NativeFitOptions {
             objective: self.resolved_objective(Some((region_markers[0], region_markers[1]))),
-            ..NativeFitOptions::default()
+            ..NativeFitOptions::robust()
         };
         match estimate_manual_peak_seeds(&request, &options) {
             Ok(estimate) => {
@@ -269,13 +266,6 @@ impl Histogram {
         if markers.peak_markers.is_empty() {
             return Err("Place at least one peak marker before fitting.".to_owned());
         }
-        if !matches!(self.fits.settings.background_model, BackgroundModel::None)
-            && markers.background_markers.is_empty()
-        {
-            return Err(
-                "Place at least one background marker window for this background model.".to_owned(),
-            );
-        }
         if let Some(error) = &markers.estimate_error {
             return Err(error.clone());
         }
@@ -289,20 +279,9 @@ impl Histogram {
     }
 
     pub fn apply_refit_all_request(&mut self) {
-        if !self.fits.take_pending_refit_all() {
-            return;
+        if self.fits.take_pending_refit_all() {
+            self.request_fit(super::fit_worker::FitTask::RefitAll);
         }
-
-        let fit_count = self.fits.stored_fits.len();
-        for _ in 0..fit_count {
-            self.fits.pending_modify_fit = Some(0);
-            self.apply_modify_fit_request();
-            self.fit_gaussians();
-            self.fits.store_temp_fit();
-        }
-        self.plot_settings.markers.clear_peak_markers();
-        self.plot_settings.markers.preview_background.clear();
-        self.plot_settings.markers.estimate_error = None;
     }
 
     pub fn apply_modify_fit_request(&mut self) {
@@ -363,17 +342,37 @@ impl Histogram {
             }
         }
 
-        self.fits.settings.background_model = match metadata.background_model.as_str() {
-            "auto" | "Auto" | "None" => BackgroundModel::None,
-            "constant" => crate::fitter::native::concrete_background_model(
-                spectrix_fitting::BackgroundKind::Constant,
-            ),
-            "linear" => BackgroundModel::Linear(Default::default()),
-            "quadratic" => BackgroundModel::Quadratic(Default::default()),
-            "exponential" => BackgroundModel::Exponential(Default::default()),
-            "powerlaw" => BackgroundModel::PowerLaw(Default::default()),
-            _ => fallback_background_model,
-        };
+        self.fits.settings.background_model =
+            if fallback_background_model.type_name() == metadata.background_model {
+                fallback_background_model
+            } else {
+                match metadata.background_model.as_str() {
+                    "auto" | "Auto" | "None" => BackgroundModel::None,
+                    "constant" => crate::fitter::native::concrete_background_model(
+                        spectrix_fitting::BackgroundKind::Constant,
+                    ),
+                    "linear" => BackgroundModel::Linear(Default::default()),
+                    "quadratic" => BackgroundModel::Quadratic(Default::default()),
+                    "exponential" => BackgroundModel::Exponential(Default::default()),
+                    "powerlaw" => BackgroundModel::PowerLaw(Default::default()),
+                    _ => fallback_background_model,
+                }
+            };
+        if let Some(background) = &moved_fit.background_result {
+            self.fits.settings.apply_background_fit(background);
+        }
+        if let Some(FitResult::Gaussian(gaussian)) = &moved_fit.fit_result {
+            self.fits.settings.equal_stddev = gaussian.fit_settings.equal_stdev;
+            self.fits.settings.free_position = gaussian.fit_settings.free_position;
+            self.fits.settings.objective = match gaussian.fit_settings.objective {
+                spectrix_fitting::ObjectiveKind::LeastSquares => {
+                    crate::fitter::fit_settings::HistogramObjective::LeastSquares
+                }
+                spectrix_fitting::ObjectiveKind::PoissonDeviance => {
+                    crate::fitter::fit_settings::HistogramObjective::PoissonDeviance
+                }
+            };
+        }
         self.fits.settings.background_coupling = background_coupling;
         self.fits.settings.lock_background = background_coupling
             == BackgroundCoupling::PrefitFrozen
@@ -397,26 +396,28 @@ impl Histogram {
     }
 
     pub fn fit_background(&mut self) {
-        let result = self
-            .background_fit_input()
-            .and_then(|input| super::live_background::calculate_background(input, self.range));
+        let result = self.background_fit_input().and_then(|input| {
+            super::live_background::calculate_background(input, self.background_display_range())
+        });
         match result {
-            Ok(mut fitter) => {
-                if let Some(background) = &fitter.background_result {
-                    self.fits.settings.apply_background_fit(background);
-                }
-                fitter.set_name(self.name.clone());
-                self.fits.style_temporary_fit(&mut fitter);
-                self.live_background.preview = Some(fitter.clone());
-                self.fits.replace_temp_fit(Some(fitter));
-                self.live_background.last_attempt = Some(self.live_background_signature());
-                self.live_background.status = None;
-            }
+            Ok(fitter) => self.install_background_fit(fitter),
             Err(error) => {
                 log::warn!("Background fit failed: {error}");
                 self.live_background.status = Some(error);
             }
         }
+    }
+
+    pub(super) fn install_background_fit(&mut self, mut fitter: Fitter) {
+        if let Some(background) = &fitter.background_result {
+            self.fits.settings.apply_background_fit(background);
+        }
+        fitter.set_name(self.name.clone());
+        self.fits.style_temporary_fit(&mut fitter);
+        self.live_background.preview = Some(fitter.clone());
+        self.fits.replace_temp_fit(Some(fitter));
+        self.live_background.last_attempt = Some(self.live_background_signature());
+        self.live_background.status = None;
     }
 
     pub fn fit_gaussians(&mut self) {
@@ -457,7 +458,11 @@ impl Histogram {
         let background_model = self.fits.settings.background_model.clone();
 
         let manual_background = reusable_manual_background(self.fits.temp_fit.as_ref());
-        let background_result = if let Some(temp_fit) = manual_background {
+        let lock_manual_background =
+            self.fits.settings.lock_background && manual_background.is_some();
+        let background_result = if let Some(temp_fit) = manual_background
+            && (background_markers.is_empty() || lock_manual_background)
+        {
             fitter.background_line = temp_fit.background_line.clone();
             temp_fit.background_result.clone()
         } else {
@@ -472,12 +477,13 @@ impl Histogram {
         fitter.background_model = background_model;
         fitter.background_result = background_result;
         fitter.background_was_fit_manually = manual_background.is_some();
-        let lock_manual_background =
-            self.fits.settings.lock_background && manual_background.is_some();
-        // Background parameters vary with the peaks unless the user explicitly locks a manual
-        // background fit. The legacy coupling field records the effective persisted behavior.
-        fitter.background_coupling =
-            background_coupling_for_fit(&fitter.background_model, lock_manual_background);
+        // Windows determine the baseline. Only windowless fits jointly refine it,
+        // unless an explicit manual background has been locked.
+        fitter.background_coupling = background_coupling_for_fit(
+            &fitter.background_model,
+            !background_markers.is_empty(),
+            lock_manual_background,
+        );
         fitter.objective = self.resolved_objective(Some((region_markers[0], region_markers[1])));
         fitter.manual_peak_bounds = Some(peak_bounds);
 
@@ -526,6 +532,10 @@ impl Histogram {
         }
 
         if let Some(FitResult::Gaussian(gaussian)) = &fitter.fit_result {
+            self.plot_settings.markers.preview_background = gaussian
+                .background_result
+                .as_ref()
+                .map_or_else(Vec::new, |background| background.get_fit_points());
             for (guess, fitted) in self
                 .plot_settings
                 .markers
@@ -594,6 +604,9 @@ impl Histogram {
         {
             temp_fit.calibrate(&self.fits.calibration);
         }
+        // Fitted handles are display updates, not a request to re-estimate constraints.
+        // A subsequent user edit will still invalidate this signature normally.
+        self.plot_settings.markers.estimate_signature = self.manual_estimate_signature();
     }
 }
 
@@ -607,7 +620,7 @@ mod tests {
     use spectrix_fitting::BackgroundCoupling;
 
     #[test]
-    fn every_unlocked_background_is_refined_with_the_peak_model() {
+    fn windows_fix_the_background_and_windowless_fits_refine_it() {
         for model in [
             BackgroundModel::Linear(Default::default()),
             BackgroundModel::Quadratic(Default::default()),
@@ -615,12 +628,20 @@ mod tests {
             BackgroundModel::Exponential(Default::default()),
         ] {
             assert_eq!(
-                background_coupling_for_fit(&model, false),
+                background_coupling_for_fit(&model, false, false),
                 BackgroundCoupling::PrefitJoint
+            );
+            assert_eq!(
+                background_coupling_for_fit(&model, true, false),
+                BackgroundCoupling::PrefitFrozen
             );
         }
         assert_eq!(
-            background_coupling_for_fit(&BackgroundModel::Quadratic(Default::default()), true,),
+            background_coupling_for_fit(
+                &BackgroundModel::Quadratic(Default::default()),
+                false,
+                true
+            ),
             BackgroundCoupling::PrefitFrozen
         );
     }

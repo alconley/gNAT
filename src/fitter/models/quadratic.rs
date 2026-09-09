@@ -110,7 +110,7 @@ impl QuadraticFitter {
                 self.data.x.clone(),
                 self.data.y.clone(),
             ),
-            &spectrix_fitting::FitOptions::default(),
+            &spectrix_fitting::FitOptions::robust(),
         )?;
         crate::fitter::native::apply_estimate(&mut self.paramaters.a, &result, "a");
         crate::fitter::native::apply_estimate(&mut self.paramaters.b, &result, "b");

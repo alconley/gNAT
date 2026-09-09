@@ -247,7 +247,7 @@ pub(crate) fn fit_report(result: &NativeFitResult) -> String {
          data points = {}\n\
          variables = {}\n\
          chi-square = {:.15e}\n\
-         reduced chi-square = {:.15e}\n\
+         reduced chi-square = {}\n\
          Akaike information criterion = {}\n\
          Bayesian information criterion = {}\n\
          R-squared = {}\n\
@@ -260,7 +260,9 @@ pub(crate) fn fit_report(result: &NativeFitResult) -> String {
         statistics.observations,
         statistics.variables,
         statistics.chi_square,
-        statistics.reduced_chi_square,
+        optional_number(
+            (statistics.degrees_of_freedom > 0).then_some(statistics.reduced_chi_square)
+        ),
         optional_number(statistics.aic),
         optional_number(statistics.bic),
         optional_number(statistics.r_squared),
@@ -274,7 +276,57 @@ pub(crate) fn fit_report(result: &NativeFitResult) -> String {
             parameter.name, parameter.value, error, parameter.kind
         ));
     }
+    if result.diagnostics.attempts > 0 {
+        report.push_str(&format!(
+            "[[Numerical diagnostics]]\nattempts (including polish) = {}\nprojected gradient = {}\nobjective improvement = {}\ncovariance = {}\nshared evaluation budget exhausted = {}\n",
+            result.diagnostics.attempts,
+            optional_number(result.diagnostics.optimality),
+            optional_number(result.statistics.objective_improvement),
+            covariance_description(result),
+            result.diagnostics.budget_exhausted,
+        ));
+    }
+    if let Some(error) = &result.diagnostics.confidence_band_error {
+        report.push_str(&format!("Confidence bands unavailable: {error}\n"));
+    }
     report
+}
+
+pub(crate) fn covariance_description(result: &NativeFitResult) -> String {
+    use spectrix_fitting::CovarianceStatus;
+    let reason = match result.diagnostics.covariance_status {
+        CovarianceStatus::Available => {
+            "Available; the model is stationary and has full numerical rank."
+        }
+        CovarianceStatus::Disabled => {
+            "Uncertainties are not calculated for this background starting estimate."
+        }
+        CovarianceStatus::NoFreeParameters => "No independently varying parameters.",
+        CovarianceStatus::InsufficientInformation => {
+            "Covariance unavailable: no residual degrees of freedom remain to estimate noise. Use wider background windows or more observations for uncertainty estimation."
+        }
+        CovarianceStatus::NotConverged => {
+            "Covariance unavailable: the solution has not converged. Review the starting values or fit region."
+        }
+        CovarianceStatus::ActiveBounds => {
+            "Covariance unavailable: parameters are limited by their bounds. Review those limits before interpreting symmetric errors."
+        }
+        CovarianceStatus::RankDeficient => {
+            "Covariance unavailable: the data cannot distinguish all parameters. Review overlapping peaks, shared widths, or background complexity."
+        }
+        CovarianceStatus::NumericalFailure => {
+            "Covariance unavailable: model derivatives or information could not be evaluated reliably."
+        }
+        CovarianceStatus::Unknown => "Parameter covariance and uncertainties are unavailable.",
+    };
+    if result.diagnostics.affected_parameters.is_empty() {
+        reason.to_owned()
+    } else {
+        format!(
+            "{reason} Parameters: {}.",
+            result.diagnostics.affected_parameters.join(", ")
+        )
+    }
 }
 
 fn optional_number(value: Option<f64>) -> String {

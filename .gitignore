@@ -1,6 +1,8 @@
 /target
 /dist
 *.json
+!crates/spectrix-fitting/tests/parity/lmfit134_backgrounds.json
+!crates/spectrix-fitting/tests/parity/lmfit134_gaussian_linear.json
 !crates/spectrix-fitting/tests/fixtures/run_83_xavg_600.json
 *.yaml
 .venv

@@ -266,7 +266,7 @@ fn histogram_1d_ui(ui: &mut egui::Ui, defaults: &mut Histogram1DDefaults, query:
             ],
         ),
         |ui| {
-            defaults.fit.ui(ui, false, false);
+            defaults.fit.ui(ui, false, false, false);
             for (label, line) in [
                 (
                     "Temporary background",

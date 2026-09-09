@@ -63,7 +63,9 @@ pub(super) fn calculate_background(mut input: Fitter, range: (f64, f64)) -> Resu
         return Err(error);
     }
     if input.background_result.is_none() {
-        return Err("Select a background model and valid background windows.".to_owned());
+        return Err(
+            "Select a background model and a valid region or background windows.".to_owned(),
+        );
     }
     input.set_background_display_range(range);
     Ok(input)
@@ -90,7 +92,6 @@ fn calculate_update(
                 "Temporary peak fit could not be rebuilt from the current markers.".to_owned(),
             );
         }
-        fit.set_background_display_range(range);
     }
     Ok(BackgroundUpdate {
         background,
@@ -99,13 +100,20 @@ fn calculate_update(
 }
 
 impl Histogram {
+    pub(super) fn background_display_range(&self) -> (f64, f64) {
+        crate::fitter::main_fitter::background_display_range(
+            &self.plot_settings.markers.get_region_marker_positions(),
+            &self.plot_settings.markers.get_background_marker_positions(),
+        )
+        .unwrap_or(self.range)
+    }
+
     pub(super) fn background_update_pending(&self) -> bool {
         self.live_background.pending.is_some()
             || (self
                 .live_background
                 .last_attempt
                 .is_some_and(|signature| signature != self.live_background_signature())
-                && !self.plot_settings.markers.background_markers.is_empty()
                 && !matches!(
                     self.fits.settings.background_model,
                     BackgroundModel::None | BackgroundModel::LegacyAuto
@@ -118,6 +126,10 @@ impl Histogram {
         self.range.0.to_bits().hash(&mut hasher);
         self.range.1.to_bits().hash(&mut hasher);
         self.bins.hash(&mut hasher);
+        // The region also determines Auto's objective, even with background windows.
+        for value in self.plot_settings.markers.get_region_marker_positions() {
+            value.to_bits().hash(&mut hasher);
+        }
         format!("{:?}", self.fits.settings.background_model).hash(&mut hasher);
         format!("{:?}", self.fits.settings.objective).hash(&mut hasher);
         for (start, end) in self.plot_settings.markers.get_background_marker_positions() {
@@ -156,15 +168,22 @@ impl Histogram {
         }
     }
 
-    /// Both G and automatic fitting use the same sorted, unique bins from the marker windows.
+    /// Both G and automatic fitting use the same region or unique window bins.
     pub(super) fn background_fit_input(&self) -> Result<Fitter, String> {
         if self.bins.is_empty() || !self.bin_width.is_finite() || self.bin_width <= 0.0 {
             return Err("The histogram has no valid bins for a background fit.".to_owned());
         }
         let windows = self.plot_settings.markers.get_background_marker_positions();
-        if windows.is_empty() {
-            return Err("Place at least one background marker window.".to_owned());
-        }
+        let automatic = windows.is_empty();
+        let windows = if automatic {
+            let region = self.plot_settings.markers.get_region_marker_positions();
+            if region.len() != 2 {
+                return Err("Place two region markers to estimate the selected background, or add background windows.".to_owned());
+            }
+            vec![(region[0], region[1])]
+        } else {
+            windows
+        };
         let centers = self.get_bin_centers();
         let mut selected = vec![false; self.bins.len()];
         for (start, end) in windows {
@@ -183,20 +202,28 @@ impl Histogram {
         if data.x.is_empty() {
             return Err("Background windows contain no histogram bins.".to_owned());
         }
-        let objective = self.fits.settings.objective.resolve(data.y.iter().copied());
+        let region = self.plot_settings.markers.get_region_marker_positions();
+        let objective = if region.len() == 2 {
+            self.resolved_objective(Some((region[0], region[1])))
+        } else {
+            self.fits.settings.objective.resolve(data.y.iter().copied())
+        };
         let mut input = Fitter::new(data);
         input.background_model = self.fits.settings.background_model.clone();
         input.objective = objective;
+        input.automatic_background = automatic;
         Ok(input)
     }
 
     pub fn refresh_live_background(&mut self, repaint_context: egui::Context) {
+        if self.fit_worker.is_pending() {
+            return;
+        }
         let key = self.live_request_key();
         if matches!(
             self.fits.settings.background_model,
             BackgroundModel::None | BackgroundModel::LegacyAuto
-        ) || self.plot_settings.markers.background_markers.is_empty()
-        {
+        ) {
             self.live_background.preview = None;
             self.live_background.last_attempt = Some(key.background);
             self.live_background.status = None;
@@ -229,7 +256,7 @@ impl Histogram {
                 return;
             }
         };
-        let range = self.range;
+        let range = self.background_display_range();
         let (sender, receiver) = mpsc::channel();
         self.live_background.pending = Some(PendingBackground {
             key,
@@ -277,6 +304,7 @@ impl Histogram {
 
     fn install_live_background(&mut self, update: BackgroundUpdate) {
         let mut background = update.background;
+        let fitted_peaks = update.gaussian.is_some();
         if let Some(gaussian) = update.gaussian {
             let show_stats = self.fits.settings.show_fit_stats;
             self.install_gaussian_fit(gaussian);
@@ -299,7 +327,11 @@ impl Histogram {
         // Preview-only estimates do not make a background manually fitted or change settings.
         background.background_was_fit_manually = false;
         self.live_background.preview = Some(background);
-        self.plot_settings.markers.estimate_signature = 0;
+        self.plot_settings.markers.estimate_signature = if fitted_peaks {
+            self.manual_estimate_signature()
+        } else {
+            0
+        };
         self.live_background.last_attempt = Some(self.live_background_signature());
         self.live_background.status = None;
     }
@@ -534,7 +566,7 @@ mod tests {
         histogram
             .plot_settings
             .markers
-            .set_background_marker_positions(&[(0.0, 2.0)]);
+            .set_background_marker_positions(&[(0.0, 1.0)]);
         histogram.refresh_live_background(egui::Context::default());
         finish_worker(&mut histogram);
         assert!(
@@ -629,29 +661,27 @@ mod tests {
             };
             assert_eq!(gaussian.fit_result[0].uuid, 42);
             assert_eq!(gaussian.fit_result[0].energy.value, Some(1332.5));
-            if locked {
-                assert!((background_at(&histogram, 50.0) - old_background).abs() > 1.0);
-                assert!(
-                    (background_at(&histogram, 50.0)
-                        - expected
-                            .background_result
-                            .as_ref()
-                            .expect("new coefficients")
-                            .evaluate(50.0))
-                    .abs()
-                        < 1e-9
-                );
-                assert_eq!(fitted.background_coupling, BackgroundCoupling::PrefitFrozen);
-                let native = gaussian.native_result.as_ref().expect("native composite");
-                assert!(
-                    native
-                        .fit
-                        .parameters
-                        .iter()
-                        .filter(|parameter| parameter.name.starts_with("bg_"))
-                        .all(|parameter| parameter.kind == ParameterKind::Fixed)
-                );
-            }
+            assert!((background_at(&histogram, 50.0) - old_background).abs() > 1.0);
+            assert!(
+                (background_at(&histogram, 50.0)
+                    - expected
+                        .background_result
+                        .as_ref()
+                        .expect("new coefficients")
+                        .evaluate(50.0))
+                .abs()
+                    < 1e-9
+            );
+            assert_eq!(fitted.background_coupling, BackgroundCoupling::PrefitFrozen);
+            let native = gaussian.native_result.as_ref().expect("native composite");
+            assert!(
+                native
+                    .fit
+                    .parameters
+                    .iter()
+                    .filter(|parameter| parameter.name.starts_with("bg_"))
+                    .all(|parameter| parameter.kind == ParameterKind::Fixed)
+            );
         }
     }
 

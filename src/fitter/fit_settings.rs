@@ -154,6 +154,7 @@ impl FitSettings {
         ui: &mut egui::Ui,
         background_parameters_are_current: bool,
         manual_background_available: bool,
+        has_background_windows: bool,
     ) {
         ui.separator();
 
@@ -196,7 +197,7 @@ impl FitSettings {
                 );
             })
             .response
-            .on_hover_text("Select the background function used during peak fitting.");
+            .on_hover_text("Choose the background function. With windows, their fitted background stays fixed during peak fitting. Without windows, background and peaks are fitted jointly.");
 
         if let BackgroundModel::Constant(parameter) = &mut self.background_model {
             parameter.ui(ui);
@@ -227,12 +228,16 @@ impl FitSettings {
             self.background_model,
             BackgroundModel::None | BackgroundModel::LegacyAuto
         ) {
+            if has_background_windows {
+                ui.label("Window background stays fixed during peak fitting.")
+                    .on_hover_text("Move or resize the windows to change the background. Its line spans the region and all background windows. Peak uncertainties are conditional on that fitted baseline.");
+            }
             ui.add_enabled(
                 manual_background_available,
                 egui::Checkbox::new(&mut self.lock_background, "Lock manual background"),
             )
             .on_hover_text(if manual_background_available {
-                "Keep the manually fitted background fixed in subsequent peak fits. Disable this to use it only as a starting estimate."
+                "Keep an explicit background fit fixed, including without windows. Window-based backgrounds already stay fixed. Peak uncertainties exclude uncertainty in a fixed background."
             } else {
                 "Run an explicit background fit first to make a lockable background available."
             });

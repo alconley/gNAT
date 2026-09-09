@@ -1336,7 +1336,7 @@ impl Fits {
                 if ui
                         .button("Refit")
                         .on_hover_text(
-                            "Re-run each stored fit on current data by loading it into temp, fitting, then storing it again.",
+                            "Refit stored fits on current data in a worker. Results replace the stored collection together; current temporary markers and fits are preserved. Editing the inputs while it runs discards the outdated results.",
                         )
                         .clicked()
                 {
@@ -2433,7 +2433,7 @@ impl Fits {
                     "Independent"
                 },
                 result.fit.termination.reason,
-            ));
+            )).on_hover_text("Convergence checks local stationarity. Inspect residuals, the background, and fit-quality warnings to assess whether the model describes the data.");
         });
         ui.label(format!(
             "Objective: {} to {:.5}  ·  improvement: {}  ·  RMSE: {:.5}  ·  R²: {}",
@@ -2572,6 +2572,7 @@ impl Fits {
             ui,
             background_parameters_are_current,
             manual_background_available,
+            !markers.background_markers.is_empty(),
         );
 
         self.visuals_ui(ui);

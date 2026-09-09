@@ -39,6 +39,18 @@ pub trait Model: Send + Sync {
         Ok(false)
     }
 
+    /// Analytic derivatives used by the robust profile. Returning false enables
+    /// scaled physical-coordinate finite differences without changing legacy fits.
+    fn robust_jacobian(
+        &self,
+        x: &[f64],
+        parameters: &ParameterValues,
+        parameter_names: &[String],
+        output: &mut [f64],
+    ) -> Result<bool, FitError> {
+        self.analytic_jacobian(x, parameters, parameter_names, output)
+    }
+
     /// Optionally evaluates row-major Jacobians for every value returned by
     /// [`Model::components`].
     ///
@@ -56,6 +68,20 @@ pub trait Model: Send + Sync {
             return Ok(false);
         }
         self.analytic_jacobian(x, parameters, parameter_names, &mut output[0])
+    }
+
+    /// Analytic component derivatives for robust uncertainty propagation.
+    fn robust_component_jacobians(
+        &self,
+        x: &[f64],
+        parameters: &ParameterValues,
+        parameter_names: &[String],
+        output: &mut [Vec<f64>],
+    ) -> Result<bool, FitError> {
+        if output.len() != 1 {
+            return Ok(false);
+        }
+        self.robust_jacobian(x, parameters, parameter_names, &mut output[0])
     }
 
     /// Optionally evaluates lmfit-compatible central-difference component Jacobians.
@@ -224,6 +250,37 @@ impl Model for CompositeModel {
         Ok(true)
     }
 
+    fn robust_jacobian(
+        &self,
+        x: &[f64],
+        parameters: &ParameterValues,
+        parameter_names: &[String],
+        output: &mut [f64],
+    ) -> Result<bool, FitError> {
+        let expected = x.len().saturating_mul(parameter_names.len());
+        if output.len() != expected {
+            return Err(FitError::LengthMismatch {
+                x: expected,
+                y: output.len(),
+            });
+        }
+        output.fill(0.0);
+        let mut temporary = checked_zeros(expected)?;
+        for component in &self.components {
+            temporary.fill(0.0);
+            if !component
+                .model
+                .robust_jacobian(x, parameters, parameter_names, &mut temporary)?
+            {
+                return Ok(false);
+            }
+            for (sum, value) in output.iter_mut().zip(&temporary) {
+                *sum += value;
+            }
+        }
+        Ok(true)
+    }
+
     fn analytic_component_jacobians(
         &self,
         x: &[f64],
@@ -242,6 +299,28 @@ impl Model for CompositeModel {
                 parameter_names,
                 component_output,
             )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn robust_component_jacobians(
+        &self,
+        x: &[f64],
+        parameters: &ParameterValues,
+        parameter_names: &[String],
+        output: &mut [Vec<f64>],
+    ) -> Result<bool, FitError> {
+        if output.len() != self.components.len() {
+            return Ok(false);
+        }
+        for (component, component_output) in self.components.iter().zip(output) {
+            component_output.fill(0.0);
+            if !component
+                .model
+                .robust_jacobian(x, parameters, parameter_names, component_output)?
+            {
                 return Ok(false);
             }
         }
@@ -636,7 +715,7 @@ impl Model for GaussianModel {
 }
 
 macro_rules! simple_model {
-    ($type:ident, $doc:literal, $name:literal, [$($field:ident),+], $body:expr) => {
+    ($type:ident, $doc:literal, $name:literal, [$($field:ident),+], $body:expr, $derivatives:expr) => {
         #[doc = $doc]
         #[derive(Debug, Clone)]
         pub struct $type {
@@ -717,6 +796,34 @@ macro_rules! simple_model {
             }
 
 
+            fn robust_jacobian(
+                &self,
+                x: &[f64],
+                parameters: &ParameterValues,
+                parameter_names: &[String],
+                output: &mut [f64],
+            ) -> Result<bool, FitError> {
+                let expected = x.len().saturating_mul(parameter_names.len());
+                if output.len() != expected {
+                    return Err(FitError::LengthMismatch { x: expected, y: output.len() });
+                }
+                let columns = [$(&self.$field),+].map(|definition| analytic_column(definition, parameter_names));
+                if columns.contains(&AnalyticColumn::UnresolvedBinding) {
+                    return Ok(false);
+                }
+                $(let $field = parameters.require(&self.$field.name)?;)+
+                output.fill(0.0);
+                for (row, independent) in x.iter().enumerate() {
+                    let derivatives = ($derivatives)(*independent, $($field),+);
+                    for (column, derivative) in columns.iter().zip(derivatives) {
+                        if let AnalyticColumn::Column(column) = column {
+                            output[row * parameter_names.len() + column] += derivative;
+                        }
+                    }
+                }
+                Ok(output.iter().all(|value| value.is_finite()))
+            }
+
             fn compatibility_component_jacobians(
                 &self,
                 x: &[f64],
@@ -749,35 +856,46 @@ simple_model!(
     "A constant background model (`c`).",
     "constant",
     [c],
-    |_x: f64, c: f64| c
+    |_x: f64, c: f64| c,
+    |_x: f64, _c: f64| [1.0]
 );
 simple_model!(
     LinearModel,
     "A linear background model (`slope * x + intercept`).",
     "linear",
     [slope, intercept],
-    |x: f64, slope: f64, intercept: f64| slope * x + intercept
+    |x: f64, slope: f64, intercept: f64| slope * x + intercept,
+    |x: f64, _slope: f64, _intercept: f64| [x, 1.0]
 );
 simple_model!(
     QuadraticModel,
     "A quadratic background model (`a * x^2 + b * x + c`).",
     "quadratic",
     [a, b, c],
-    |x: f64, a: f64, b: f64, c: f64| a * x * x + b * x + c
+    |x: f64, a: f64, b: f64, c: f64| a * x * x + b * x + c,
+    |x: f64, _a: f64, _b: f64, _c: f64| [x * x, x, 1.0]
 );
 simple_model!(
     ExponentialModel,
     "An exponential background model (`amplitude * exp(-x / decay)`).",
     "exponential",
     [amplitude, decay],
-    |x: f64, amplitude: f64, decay: f64| amplitude * (-x / decay).exp()
+    |x: f64, amplitude: f64, decay: f64| amplitude * (-x / decay).exp(),
+    |x: f64, amplitude: f64, decay: f64| [
+        (-x / decay).exp(),
+        amplitude * (-x / decay).exp() * x / decay.powi(2)
+    ]
 );
 simple_model!(
     PowerLawModel,
     "A power-law background model (`amplitude * x^exponent`).",
     "power-law",
     [amplitude, exponent],
-    |x: f64, amplitude: f64, exponent: f64| amplitude * x.powf(exponent)
+    |x: f64, amplitude: f64, exponent: f64| amplitude * x.powf(exponent),
+    |x: f64, amplitude: f64, exponent: f64| [
+        x.powf(exponent),
+        amplitude * x.powf(exponent) * x.ln()
+    ]
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

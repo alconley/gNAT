@@ -23,8 +23,8 @@ pub use parameter::{
     ParameterKind, ParameterValues,
 };
 pub use solver::{
-    ConfidenceBand, Covariance, FitOptions, FitProblem, FitResult, FitStatistics, ObjectiveKind,
-    SolverProfile, TerminationStatus, fit,
+    ConfidenceBand, Covariance, CovarianceStatus, FitDiagnostics, FitOptions, FitProblem,
+    FitResult, FitStatistics, ObjectiveKind, SolverProfile, TerminationStatus, fit,
 };
 pub use spectrum::{
     BackgroundCoupling, BackgroundFitRequest, BackgroundKind, BackgroundSeed, FitQualityIssue,

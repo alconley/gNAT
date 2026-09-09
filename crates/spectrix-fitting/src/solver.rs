@@ -16,12 +16,16 @@ use crate::{
 
 const MAX_VALUES: usize = 16_777_216;
 
+mod robust;
+
 /// Numerical compatibility profiles offered by the fitting engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SolverProfile {
     /// lmfit 1.3.4 `Model.fit(method="leastsq")` compatible settings.
     #[default]
     Lmfit134,
+    /// Physical-coordinate diagnostics, stable bounds, and automatic polishing.
+    Robust,
 }
 
 /// Residual objective minimized by the nonlinear solver.
@@ -76,6 +80,20 @@ impl Default for FitOptions {
             confidence_sigma: 1.0,
             calculate_covariance: true,
             evaluation_x: None,
+        }
+    }
+}
+
+impl FitOptions {
+    /// Recommended settings for new fits; compatibility defaults remain unchanged.
+    #[must_use]
+    pub fn robust() -> Self {
+        Self {
+            profile: SolverProfile::Robust,
+            ftol: 1.0e-13,
+            xtol: 1.0e-13,
+            gtol: 1.0e-8,
+            ..Self::default()
         }
     }
 }
@@ -141,7 +159,8 @@ pub struct FitStatistics {
     pub degrees_of_freedom: usize,
     /// Weighted sum of squared residuals.
     pub chi_square: f64,
-    /// Chi-square divided by the degrees of freedom.
+    /// Chi-square divided by `max(1, degrees_of_freedom)`. With zero degrees
+    /// of freedom this compatibility field is not a residual variance estimate.
     pub reduced_chi_square: f64,
     /// Selected objective evaluated at the exact user-supplied starting values.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -186,10 +205,58 @@ pub struct FitStatistics {
 pub struct Covariance {
     /// Parameter ordering for both matrices.
     pub parameter_names: Vec<String>,
-    /// Reduced-chi-square-scaled covariance matrix.
+    /// Physical parameter covariance: reduced-chi-square scaled for least squares,
+    /// and likelihood information based for Poisson fits.
     pub matrix: Vec<Vec<f64>>,
     /// Correlation matrix.
     pub correlations: Vec<Vec<f64>>,
+}
+
+/// Why symmetric parameter uncertainties are available or withheld.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum CovarianceStatus {
+    /// A saved result predates structured covariance diagnostics.
+    #[default]
+    Unknown,
+    /// The converged, interior model has full numerical rank.
+    Available,
+    /// Covariance was not requested.
+    Disabled,
+    /// There are no independently varying parameters.
+    NoFreeParameters,
+    /// The parameters can be fitted, but no residual degrees of freedom remain
+    /// to estimate least-squares noise variance.
+    InsufficientInformation,
+    /// The returned solution is not stationary.
+    NotConverged,
+    /// One or more parameters are limited by their bounds.
+    ActiveBounds,
+    /// Observations cannot distinguish all the varied parameters.
+    RankDeficient,
+    /// A derivative or matrix calculation could not be evaluated reliably.
+    NumericalFailure,
+}
+
+/// Additional diagnostics for robust fits, defaulted when reading older results.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(default))]
+pub struct FitDiagnostics {
+    /// Number of optimizer runs, including polishing and recovery.
+    pub attempts: usize,
+    /// Maximum scaled projected gradient at the selected solution.
+    pub optimality: Option<f64>,
+    /// Numerical rank of the scaled information Jacobian, when available.
+    pub rank: Option<usize>,
+    /// Explanation of covariance availability.
+    pub covariance_status: CovarianceStatus,
+    /// Parameter names involved in boundary or rank failures.
+    pub affected_parameters: Vec<String>,
+    /// Whether the shared residual-evaluation budget was exhausted.
+    pub budget_exhausted: bool,
+    /// Reason confidence bands could not be propagated, without discarding the fit.
+    pub confidence_band_error: Option<String>,
 }
 
 /// Why the solver stopped and whether the estimate is considered successful.
@@ -212,7 +279,7 @@ pub struct ConfidenceBand {
     pub x: Vec<f64>,
     /// Best-fit curve.
     pub best_fit: Vec<f64>,
-    /// Student-t-scaled standard uncertainty.
+    /// Student-t-scaled least-squares or normal-scaled Poisson uncertainty.
     pub uncertainty: Vec<f64>,
     /// Lower confidence curve.
     pub lower: Vec<f64>,
@@ -235,6 +302,12 @@ pub struct FitResult {
     /// Untransformed residuals on the observation grid (`data - model`).
     #[cfg_attr(feature = "serde", serde(default))]
     pub raw_residuals: Vec<f64>,
+    /// Coordinates of the observations, including any external background windows.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub observation_x: Vec<f64>,
+    /// Structured numerical diagnostics; absent from older saved fits.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub diagnostics: FitDiagnostics,
     /// Grid used for `best_fit`, components, and confidence bands.
     pub evaluation_x: Vec<f64>,
     /// Best-fit total curve on the evaluation grid.
@@ -255,6 +328,9 @@ pub struct FitResult {
     reason = "the top-level fit pipeline is intentionally linear and auditable"
 )]
 pub fn fit(problem: &FitProblem, options: &FitOptions) -> Result<FitResult, FitError> {
+    if options.profile == SolverProfile::Robust {
+        return robust::fit(problem, options, &[]);
+    }
     validate_problem(problem, options)?;
     let definitions = problem.model.parameter_definitions();
     let layout = ParameterLayout::new(definitions)?;
@@ -385,6 +461,7 @@ pub fn fit(problem: &FitProblem, options: &FitOptions) -> Result<FitResult, FitE
                 options.confidence_sigma,
                 &best_fit,
                 &components,
+                SolverProfile::Lmfit134,
             )
             .map_or_else(|_| (None, Vec::new()), |(total, all)| (Some(total), all))
         },
@@ -396,6 +473,8 @@ pub fn fit(problem: &FitProblem, options: &FitOptions) -> Result<FitResult, FitE
         statistics,
         residuals,
         raw_residuals,
+        observation_x: problem.x.clone(),
+        diagnostics: FitDiagnostics::default(),
         evaluation_x: evaluation_x.to_vec(),
         best_fit,
         components,
@@ -403,6 +482,18 @@ pub fn fit(problem: &FitProblem, options: &FitOptions) -> Result<FitResult, FitE
         confidence_band,
         component_bands,
     })
+}
+
+pub(crate) fn fit_with_starts(
+    problem: &FitProblem,
+    options: &FitOptions,
+    starts: &[ParameterValues],
+) -> Result<FitResult, FitError> {
+    if options.profile == SolverProfile::Robust {
+        robust::fit(problem, options, starts)
+    } else {
+        fit(problem, options)
+    }
 }
 
 fn validate_problem(problem: &FitProblem, options: &FitOptions) -> Result<(), FitError> {
@@ -547,6 +638,14 @@ impl ParameterLayout {
     }
 
     fn external_values(&self, internal: &[f64]) -> Result<ParameterValues, FitError> {
+        self.values_with_transform(internal, from_internal)
+    }
+
+    fn values_with_transform(
+        &self,
+        internal: &[f64],
+        transform: fn(f64, Bounds) -> f64,
+    ) -> Result<ParameterValues, FitError> {
         if internal.len() != self.free.len() {
             return Err(FitError::LengthMismatch {
                 x: self.free.len(),
@@ -557,7 +656,7 @@ impl ParameterLayout {
         for entry in &self.entries {
             if entry.definition.binding.is_none() {
                 let value = entry.free_index.map_or(entry.definition.initial, |index| {
-                    from_internal(internal[index], entry.definition.bounds)
+                    transform(internal[index], entry.definition.bounds)
                 });
                 values.insert(entry.definition.name.clone(), value);
             }
@@ -1045,7 +1144,7 @@ fn statistics(
     let count = observations.len();
     let degrees_of_freedom = count - variables;
     let chi_square = residuals.iter().map(|value| value * value).sum::<f64>();
-    let reduced_chi_square = chi_square / degrees_of_freedom as f64;
+    let reduced_chi_square = chi_square / degrees_of_freedom.max(1) as f64;
     let objective_improvement = initial_objective
         .is_finite()
         .then(|| (initial_objective - chi_square) / initial_objective.abs().max(f64::EPSILON));
@@ -1067,7 +1166,7 @@ fn statistics(
             Some(chi_square + 2.0 * variables as f64),
             Some(chi_square + (count as f64).ln() * variables as f64),
             Some(chi_square),
-            Some(reduced_chi_square),
+            (degrees_of_freedom > 0).then_some(reduced_chi_square),
         ),
     };
     let mean = observations.iter().sum::<f64>() / count as f64;
@@ -1089,8 +1188,9 @@ fn statistics(
             .map(|(observed, model)| (observed - model).powi(2) / model.max(POISSON_FLOOR))
             .sum::<f64>()
     });
-    let reduced_pearson_chi_square =
-        pearson_chi_square.map(|value| value / degrees_of_freedom as f64);
+    let reduced_pearson_chi_square = pearson_chi_square
+        .filter(|_| degrees_of_freedom > 0)
+        .map(|value| value / degrees_of_freedom as f64);
     let goodness_of_fit_p_value = deviance.and_then(|value| {
         ChiSquared::new(degrees_of_freedom as f64)
             .ok()
@@ -1134,6 +1234,7 @@ fn confidence_bands(
     sigma: f64,
     best_fit: &[f64],
     components: &[ComponentCurve],
+    profile: SolverProfile,
 ) -> Result<(ConfidenceBand, Vec<(String, ConfidenceBand)>), FitError> {
     let scalars_per_row = layout
         .free
@@ -1158,6 +1259,7 @@ fn confidence_bands(
             layout,
             covariance,
             components.len(),
+            profile,
         )?;
         append_band_from_jacobian(
             &mut total,
@@ -1206,6 +1308,7 @@ fn evaluation_jacobians(
     layout: &ParameterLayout,
     covariance: &DMatrix<f64>,
     component_count: usize,
+    profile: SolverProfile,
 ) -> Result<(DMatrix<f64>, Vec<DMatrix<f64>>), FitError> {
     check_allocation(
         x.len(),
@@ -1225,19 +1328,31 @@ fn evaluation_jacobians(
             let stderr = covariance[(column, column)].max(0.0).sqrt();
             let base_name = &parameter_names[column];
             let base_value = baseline.require(base_name)?;
-            Ok((stderr * 0.01).max(f64::EPSILON.sqrt() * base_value.abs().max(1.0)))
+            if profile == SolverProfile::Robust {
+                let bounds = layout.entries[layout.free[column]].definition.bounds;
+                let span = bounds.upper.upper_value() - bounds.lower.lower_value();
+                let scale = span.min(base_value.abs().max(1.0));
+                Ok((f64::EPSILON.cbrt() * scale).max(8.0 * f64::EPSILON * base_value.abs()))
+            } else {
+                Ok((stderr * 0.01).max(f64::EPSILON.sqrt() * base_value.abs().max(1.0)))
+            }
         })
         .collect::<Result<Vec<_>, FitError>>()?;
     let mut compatibility = (0..component_count)
         .map(|_| checked_zeros(x.len().saturating_mul(layout.free.len())))
         .collect::<Result<Vec<_>, FitError>>()?;
-    if model.compatibility_component_jacobians(
-        x,
-        baseline,
-        &parameter_names,
-        &steps,
-        &mut compatibility,
-    )? {
+    let analytic = if profile == SolverProfile::Robust {
+        model.robust_component_jacobians(x, baseline, &parameter_names, &mut compatibility)?
+    } else {
+        model.compatibility_component_jacobians(
+            x,
+            baseline,
+            &parameter_names,
+            &steps,
+            &mut compatibility,
+        )?
+    };
+    if analytic {
         for (destination, values) in component_jacobians.iter_mut().zip(compatibility) {
             *destination = DMatrix::from_row_slice(x.len(), layout.free.len(), &values);
             total_jacobian += &*destination;
@@ -1248,8 +1363,22 @@ fn evaluation_jacobians(
         let base_name = &layout.entries[layout.free[column]].definition.name;
         let base_value = baseline.require(base_name)?;
         let step = steps[column];
-        let plus = layout.set_free_external(baseline, column, base_value + step);
-        let minus = layout.set_free_external(baseline, column, base_value - step);
+        let bounds = layout.entries[layout.free[column]].definition.bounds;
+        let (plus_value, minus_value) = if profile == SolverProfile::Robust {
+            (
+                (base_value + step).min(bounds.upper.upper_value()),
+                (base_value - step).max(bounds.lower.lower_value()),
+            )
+        } else {
+            (base_value + step, base_value - step)
+        };
+        let denominator = if profile == SolverProfile::Robust {
+            plus_value - minus_value
+        } else {
+            2.0 * step
+        };
+        let plus = layout.set_free_external(baseline, column, plus_value);
+        let minus = layout.set_free_external(baseline, column, minus_value);
         let plus_components = model.components(x, &plus)?;
         let minus_components = model.components(x, &minus)?;
         if plus_components.len() != component_count || minus_components.len() != component_count {
@@ -1266,9 +1395,9 @@ fn evaluation_jacobians(
                 plus_total += plus_value;
                 minus_total += minus_value;
                 component_jacobians[component][(row, column)] =
-                    (plus_value - minus_value) / (2.0 * step);
+                    (plus_value - minus_value) / denominator;
             }
-            total_jacobian[(row, column)] = (plus_total - minus_total) / (2.0 * step);
+            total_jacobian[(row, column)] = (plus_total - minus_total) / denominator;
         }
     }
     Ok((total_jacobian, component_jacobians))

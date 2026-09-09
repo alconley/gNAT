@@ -66,11 +66,11 @@ impl Histogram {
             }
 
             if fit_background {
-                self.fit_background();
+                self.request_fit(super::fit_worker::FitTask::Background);
             }
 
             if fit_gaussians {
-                self.fit_gaussians();
+                self.request_fit(super::fit_worker::FitTask::Peaks);
             }
 
             if store_fit && self.fits.temp_fit_is_storable() {
@@ -121,8 +121,8 @@ impl Histogram {
                 .on_hover_text("The cut span can be moved by dragging between the vertical lines while keeping the width fixed.");
             ui.separator();
             ui.label("Fitting");
-            ui.label("G: Fit Background").on_hover_text("Explicitly fit the selected background model and make it available for locking. Background marker edits already refresh the displayed fit automatically.");
-            ui.label("F: Fit Gaussians").on_hover_text("Fit gaussians at the peak markers give some region with a linear background");
+            ui.label("G: Fit Background").on_hover_text("Estimate the selected background in a worker and make it available for locking. Uses your background windows when present; otherwise estimates from the region.");
+            ui.label("F: Fit Gaussians").on_hover_text("Fit the marked peaks and selected background in a worker, with automatic polishing and recovery. Background windows are optional. With windows, their background stays fixed; without windows, peaks and background are fitted jointly.");
             ui.label("S: Store Fit").on_hover_text("Store the current fit as a permanent fit which can be saved and loaded later");
             ui.separator();
             ui.label("Peak Finder");

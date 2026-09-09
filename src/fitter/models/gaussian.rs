@@ -331,6 +331,10 @@ pub struct GaussianFitMetadata {
     pub peak_bounds: Vec<ManualPeakBounds>,
     pub background_markers: Vec<(f64, f64)>,
     pub background_model: String,
+    /// Original inputs retained independently of the fitted marker values.
+    pub submitted_peak_seeds: Vec<ManualPeakSeed>,
+    pub submitted_peak_bounds: Vec<ManualPeakBounds>,
+    pub submitted_background_seed: Option<spectrix_fitting::BackgroundSeed>,
 }
 
 #[derive(Default, Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -436,6 +440,9 @@ impl GaussianFitter {
                 peak_bounds: self.manual_peak_bounds.clone().unwrap_or_default(),
                 background_markers: self.background_markers.clone(),
                 background_model: self.background_model.type_name(),
+                submitted_peak_seeds: Vec::new(),
+                submitted_peak_bounds: self.manual_peak_bounds.clone().unwrap_or_default(),
+                submitted_background_seed: None,
             },
             false,
         )
@@ -631,6 +638,7 @@ impl GaussianFitter {
     }
 
     pub(crate) fn compact_display_data(&mut self) {
+        self.extend_background_display();
         if self.fit_points.len() > Self::MAX_COMPOSITION_DISPLAY_POINTS {
             let (xs, ys): (Vec<_>, Vec<_>) = self
                 .fit_points
@@ -721,6 +729,23 @@ impl GaussianFitter {
         self.calibrate_parameters(calibration);
     }
 
+    fn extend_background_display(&mut self) {
+        let Some(range) = crate::fitter::main_fitter::background_display_range(
+            &self.region_markers,
+            &self.background_markers,
+        ) else {
+            return;
+        };
+        if let Some(background) = &mut self.background_result {
+            let points = background.get_fit_points();
+            if points.first().map(|point| point[0]) != Some(range.0)
+                || points.last().map(|point| point[0]) != Some(range.1)
+            {
+                background.set_display_range(range);
+            }
+        }
+    }
+
     /// Fits the configured Gaussian/background model using the native Rust backend.
     pub fn fit_native(&mut self) -> Result<(), NativeFitError> {
         if self.region_markers.len() != 2 {
@@ -743,7 +768,6 @@ impl GaussianFitter {
                 parameter.vary = false;
             }
         }
-        let fitted_background_kind = native::background_kind(&self.background_model);
         let request = PeakFitRequest {
             x: self.data.x.clone(),
             y: self.data.y.clone(),
@@ -766,10 +790,12 @@ impl GaussianFitter {
         };
         let options = NativeFitOptions {
             objective: self.fit_settings.objective,
-            ..NativeFitOptions::default()
+            ..NativeFitOptions::robust()
         };
         let mut native_result = fit_native_peaks(&request, &options)?;
-        self.background_model = native::concrete_background_model(fitted_background_kind);
+        if matches!(self.background_model, BackgroundModel::LegacyAuto) {
+            self.background_model = BackgroundModel::None;
+        }
 
         let estimate = |name: &str| {
             native_result
@@ -866,10 +892,27 @@ impl GaussianFitter {
             .zip(composition_y.iter().copied())
             .map(Into::into)
             .collect();
-        self.uncertainty_band =
-            Self::build_uncertainty_band(&composition_x, &composition_y, &composition_uncertainty)
-                .unwrap_or_default();
+        self.uncertainty_band = native_result
+            .fit
+            .confidence_band
+            .as_ref()
+            .and_then(|_| {
+                Self::build_uncertainty_band(
+                    &composition_x,
+                    &composition_y,
+                    &composition_uncertainty,
+                )
+            })
+            .unwrap_or_default();
         self.fit_report = native::fit_report(&native_result.fit);
+        if self.background_coupling == BackgroundCoupling::PrefitFrozen
+            && !matches!(self.background_model, BackgroundModel::None)
+        {
+            if !self.background_markers.is_empty() {
+                self.fit_report.push_str("\nBackground windows determine the fixed baseline; peak-region bins do not change it.\n");
+            }
+            self.fit_report.push_str("\nPeak uncertainties are conditional on the fixed background; background uncertainty is excluded.\n");
+        }
         self.fit_warning = (!native_result.quality_issues.is_empty()).then(|| {
             native_result
                 .quality_issues
@@ -879,7 +922,7 @@ impl GaussianFitter {
                         format!("The optimizer did not converge: {reason}")
                     }
                     spectrix_fitting::FitQualityIssue::MissingCovariance => {
-                        "Parameter covariance and uncertainties are unavailable.".to_owned()
+                        native::covariance_description(&native_result.fit)
                     }
                     spectrix_fitting::FitQualityIssue::NonFiniteResult => {
                         "The fit contains a non-finite parameter or curve value.".to_owned()
@@ -921,6 +964,7 @@ impl GaussianFitter {
             &native_result.fit,
             self.data.clone(),
         );
+        self.extend_background_display();
         self.fit_metadata = Some(GaussianFitMetadata {
             region_markers: native_result.region.to_vec(),
             peak_markers: native_result.peak_markers.clone(),
@@ -932,6 +976,9 @@ impl GaussianFitter {
                 self.background_markers.clone()
             },
             background_model: self.background_model.type_name(),
+            submitted_peak_seeds: native_result.peak_seeds.clone(),
+            submitted_peak_bounds: self.manual_peak_bounds.clone().unwrap_or_default(),
+            submitted_background_seed: request.background_seed.clone(),
         });
         self.lmfit_result = None;
         // The full parameter covariance, residuals, and statistics are retained.

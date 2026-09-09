@@ -4,7 +4,7 @@ use crate::{
     Bound, Bounds, CompositeModel, ConstantModel, DerivedParameter, ExponentialModel, FitError,
     FitOptions, FitProblem, FitResult, LinearModel, Model, ModelComponent, ObjectiveKind,
     ParameterBinding, ParameterDefinition, ParameterKind, ParameterValues, PowerLawModel,
-    QuadraticModel, fit,
+    QuadraticModel, SolverProfile, fit,
 };
 
 /// How background seed values participate in the composite peak fit.
@@ -213,7 +213,7 @@ pub struct BackgroundFitRequest {
     pub bin_width: f64,
     /// Inclusive region; marker order is normalized.
     pub region: [f64; 2],
-    /// Inclusive background marker windows. Empty is valid only for [`BackgroundKind::None`].
+    /// Inclusive background windows. The robust profile estimates from the region when empty.
     pub markers: Vec<(f64, f64)>,
     /// Background equation.
     pub kind: BackgroundKind,
@@ -237,7 +237,7 @@ pub struct PeakFitRequest {
     pub peak_seeds: Vec<ManualPeakSeed>,
     /// Optional one-for-one visible convergence limits for the supplied seeds.
     pub peak_bounds: Option<Vec<ManualPeakBounds>>,
-    /// Inclusive background marker windows. Empty is valid only for [`BackgroundKind::None`].
+    /// Inclusive background windows. The robust profile estimates from the region when empty.
     pub background_markers: Vec<(f64, f64)>,
     /// Explicit background equation.
     pub background: BackgroundKind,
@@ -259,7 +259,7 @@ pub struct PeakFitRequest {
 pub struct SpectrumFitResult {
     /// Composite Gaussian/background fit.
     pub fit: FitResult,
-    /// Background fit on the user-selected background-window bins.
+    /// Initialization from window bins or a peak-resistant region estimate.
     pub background_prefit: FitResult,
     /// Sorted inclusive region used by the fit.
     pub region: [f64; 2],
@@ -269,7 +269,7 @@ pub struct SpectrumFitResult {
     pub background_coupling: BackgroundCoupling,
     /// Exact sorted manual seeds used to construct the fit.
     pub peak_seeds: Vec<ManualPeakSeed>,
-    /// Initial parameter definitions used by the one composite solve.
+    /// Initial parameter definitions before composite optimization and recovery.
     pub initial_parameters: Vec<ParameterDefinition>,
     /// Advisory diagnostics attached to the completed result.
     pub quality_issues: Vec<FitQualityIssue>,
@@ -287,7 +287,9 @@ impl SpectrumFitResult {
     }
 }
 
-/// Fits the selected background family using only explicit marker windows.
+/// Fits the selected background family.
+///
+/// The robust profile uses a peak-resistant region estimate when no windows are supplied.
 /// [`BackgroundKind::None`] evaluates a fixed zero baseline and needs no windows.
 pub fn fit_background(
     request: &BackgroundFitRequest,
@@ -295,13 +297,21 @@ pub fn fit_background(
 ) -> Result<FitResult, FitError> {
     validate_data(&request.x, &request.y, request.bin_width)?;
     let region = sorted_region(request.region)?;
-    require_manual_background_markers(request.kind, &request.markers)?;
-    validate_power_law_domain(request.kind, &request.x)?;
-    let (x, y) = if request.kind == BackgroundKind::None {
+    if options.profile == SolverProfile::Lmfit134 {
+        require_manual_background_markers(request.kind, &request.markers)?;
+    }
+    let automatic = request.kind != BackgroundKind::None && request.markers.is_empty();
+    let (x, y) = if request.kind == BackgroundKind::None || automatic {
         region_data(&request.x, &request.y, region)?
+    } else if options.profile == SolverProfile::Robust {
+        unique_window_data(&request.x, &request.y, &request.markers)?
     } else {
         background_data(&request.x, &request.y, &request.markers)?
     };
+    validate_power_law_domain(request.kind, &x)?;
+    if automatic {
+        return automatic_background(request, options, region, &x, &y);
+    }
     let initial_values = robust_background_values(request.kind, &x, &y, region);
     let definitions = background_definitions(
         request.kind,
@@ -328,8 +338,11 @@ pub fn estimate_manual_peak_seeds(
     validate_data(&request.x, &request.y, request.bin_width)?;
     let region = sorted_region(request.region)?;
     let markers = validated_manual_markers(&request.peak_markers, region, request.bin_width)?;
-    require_manual_background_markers(request.background, &request.background_markers)?;
-    validate_power_law_domain(request.background, &request.x)?;
+    if options.profile == SolverProfile::Lmfit134 {
+        require_manual_background_markers(request.background, &request.background_markers)?;
+    }
+    let (region_x, _) = region_data(&request.x, &request.y, region)?;
+    validate_power_law_domain(request.background, &region_x)?;
 
     let background_prefit = fit_background(
         &BackgroundFitRequest {
@@ -364,7 +377,8 @@ pub fn estimate_manual_peak_seeds(
     })
 }
 
-/// Fits exactly the supplied Gaussian seeds with one deterministic composite solve.
+/// Fits exactly the supplied Gaussian components. Robust fits polish the solution
+/// and recover deterministically when the first solution is unreliable.
 #[expect(
     clippy::too_many_lines,
     reason = "manual model assembly is intentionally explicit"
@@ -379,7 +393,9 @@ pub fn fit_peaks(
     if region_x.len() < 2 {
         return Err(FitError::InvalidRegion);
     }
-    require_manual_background_markers(request.background, &request.background_markers)?;
+    if options.profile == SolverProfile::Lmfit134 {
+        require_manual_background_markers(request.background, &request.background_markers)?;
+    }
     validate_power_law_domain(request.background, &region_x)?;
     let peak_seeds = validated_manual_seeds(&request.peak_seeds, region, request.bin_width)?;
     let peak_bounds = validated_manual_peak_bounds(
@@ -501,14 +517,29 @@ pub fn fit_peaks(
             evaluation_count,
         )?);
     }
-    let fit = fit(
-        &FitProblem::new(model, region_x.clone(), region_y.clone()),
+    let (observation_x, observation_y) = composite_data(request, options, region)?;
+    validate_power_law_domain(request.background, &observation_x)?;
+    let starts = if options.profile == SolverProfile::Robust {
+        recovery_starts(
+            request,
+            region,
+            &states,
+            &background_definitions,
+            &region_x,
+            &region_y,
+        )?
+    } else {
+        Vec::new()
+    };
+    let fit = crate::solver::fit_with_starts(
+        &FitProblem::new(model, observation_x.clone(), observation_y.clone()),
         &fit_options,
+        &starts,
     )?;
     let (quality_status, quality_issues) = assess_quality(
         &fit,
-        &region_x,
-        &region_y,
+        &observation_x,
+        &observation_y,
         request.bin_width,
         peak_seeds.len(),
     );
@@ -523,6 +554,163 @@ pub fn fit_peaks(
         quality_issues,
         quality_status,
     })
+}
+
+fn composite_data(
+    request: &PeakFitRequest,
+    options: &FitOptions,
+    region: [f64; 2],
+) -> Result<(Vec<f64>, Vec<f64>), FitError> {
+    if options.profile != SolverProfile::Robust
+        || request.background == BackgroundKind::None
+        || request.background_coupling == BackgroundCoupling::PrefitFrozen
+        || request.background_markers.is_empty()
+    {
+        return region_data(&request.x, &request.y, region);
+    }
+    // Select each original bin once, even if several windows overlap the region.
+    let mut windows = request.background_markers.clone();
+    windows.push((region[0], region[1]));
+    unique_window_data(&request.x, &request.y, &windows)
+}
+
+fn unique_window_data(
+    x: &[f64],
+    y: &[f64],
+    windows: &[(f64, f64)],
+) -> Result<(Vec<f64>, Vec<f64>), FitError> {
+    if windows
+        .iter()
+        .any(|(start, end)| !start.is_finite() || !end.is_finite())
+    {
+        return Err(FitError::NonFinite {
+            context: "background windows".to_owned(),
+        });
+    }
+    let mut selected = x
+        .iter()
+        .copied()
+        .zip(y.iter().copied())
+        .filter(|(x, _)| {
+            windows
+                .iter()
+                .any(|(start, end)| *x >= start.min(*end) && *x <= start.max(*end))
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(FitError::InvalidRegion);
+    }
+    selected.sort_by(|left, right| left.0.total_cmp(&right.0));
+    Ok(selected.into_iter().unzip())
+}
+
+fn automatic_background(
+    request: &BackgroundFitRequest,
+    options: &FitOptions,
+    region: [f64; 2],
+    x: &[f64],
+    y: &[f64],
+) -> Result<FitResult, FitError> {
+    let initial = robust_background_values(request.kind, x, y, region);
+    let mut definitions =
+        background_definitions(request.kind, request.seed.as_ref(), Some(&initial), true);
+    let mut weights = vec![1.0; x.len()];
+    let mut estimate_options = options.clone();
+    estimate_options.objective = ObjectiveKind::LeastSquares;
+    // This is an initialization, not an uncertainty model for the final fit.
+    estimate_options.calculate_covariance = false;
+    estimate_options.evaluation_x = Some(x.to_vec());
+    let mut result = None;
+    for _ in 0..10 {
+        let fitted = fit(
+            &FitProblem::new(
+                background_model(request.kind, &definitions, region),
+                x.to_vec(),
+                y.to_vec(),
+            )
+            .with_weights(weights.clone()),
+            &estimate_options,
+        )?;
+        for (weight, residual) in weights.iter_mut().zip(&fitted.raw_residuals) {
+            // FitProblem weights multiply residuals, so use the square root of
+            // the asymmetric least-squares weight.
+            *weight = if *residual > 0.0 {
+                0.05_f64.sqrt()
+            } else {
+                0.95_f64.sqrt()
+            };
+        }
+        for definition in &mut definitions {
+            if let Some(parameter) = fitted
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == definition.name)
+            {
+                definition.initial = clamp_to_bounds(parameter.value, definition.bounds);
+            }
+        }
+        result = Some(fitted);
+    }
+    result.ok_or_else(|| FitError::Solver {
+        message: "automatic background produced no estimate".to_owned(),
+    })
+}
+
+fn recovery_starts(
+    request: &PeakFitRequest,
+    region: [f64; 2],
+    states: &[PeakState],
+    background: &[ParameterDefinition],
+    x: &[f64],
+    y: &[f64],
+) -> Result<Vec<ParameterValues>, FitError> {
+    let baseline = evaluate_background_definitions(request.background, background, x)?;
+    let signal = y
+        .iter()
+        .zip(baseline)
+        .map(|(count, level)| count - level)
+        .collect::<Vec<_>>();
+    let markers = states.iter().map(|state| state.center).collect::<Vec<_>>();
+    let estimated = estimate_manual_components(
+        x,
+        &signal,
+        &markers,
+        region,
+        request.bin_width,
+        request.equal_sigma,
+    );
+    let mut starts = Vec::new();
+    for factor in [None, Some(0.5), Some(2.0)] {
+        let mut alternative = states.to_vec();
+        for (index, state) in alternative.iter_mut().enumerate() {
+            let proposed = factor.map_or_else(
+                || {
+                    estimated
+                        .get(index)
+                        .filter(|estimate| estimate.valid)
+                        .map_or(state.sigma, |estimate| estimate.seed.sigma)
+                },
+                |factor| state.sigma * factor,
+            );
+            state.sigma = clamp_to_bounds(proposed, state.sigma_bounds);
+        }
+        let model = build_peak_model(
+            request.background,
+            background,
+            region,
+            request.bin_width,
+            &alternative,
+            request.equal_sigma,
+            request.free_centers,
+            true,
+        )?;
+        let mut values = ParameterValues::new();
+        for definition in model.parameter_definitions() {
+            values.insert(definition.name, definition.initial);
+        }
+        starts.push(values);
+    }
+    Ok(starts)
 }
 
 fn require_manual_background_markers(
@@ -1364,6 +1552,8 @@ fn assess_quality(
                 .sqrt())
         .max(6.0 * noise);
         if raw[index] > threshold
+            && (x[index] - x[index - 1]).abs() <= 1.5 * bin_width
+            && (x[index + 1] - x[index]).abs() <= 1.5 * bin_width
             && raw[index] >= raw[index - 1]
             && raw[index] > raw[index + 1]
             && fitted_peaks.iter().all(|(center, sigma)| {
